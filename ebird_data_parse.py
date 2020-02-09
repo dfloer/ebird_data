@@ -5,7 +5,6 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 import re
 from functools import lru_cache
-from shapely.geometry import Point
 from models import Checklist, Country, County, Locality, Location, Observation, Observer, Species, StateProvince, SubSpecies
 from sqlalchemy import create_engine 
 from sqlalchemy.orm import scoped_session, sessionmaker
@@ -13,7 +12,6 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import ClauseElement
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.exc import  NoResultFound
-from geoalchemy2.shape import from_shape
 
 Base = declarative_base()
 DBSession = scoped_session(sessionmaker())
@@ -218,7 +216,7 @@ def parse_ebird_dump(file_path, start_row, taxa_csv_path=None):
                 # Location
                 lat = float(row['LATITUDE'])
                 lon = float(row['LONGITUDE'])
-                coords = from_shape(Point(lon, lat), srid=4326)  # PostGIS and SQLalchemy both expect this as a longitude/latitude pair.
+                coords = coords_to_EWKT(lat=lat, lon=lon, srid=4326)
                 locality_name = row['LOCALITY']
                 # In data in the form of 'L#######' but we want just #s.
                 locality_id = int(row['LOCALITY ID'][1:])
@@ -493,6 +491,14 @@ def protocol_words_to_code(protocol):
         'Tricolored Blackbird Winter Survey': '75',
         }
     return conversion[protocol]
+
+
+def coords_to_EWKT(lat, lon, srid=4326):
+    """
+    Converts lat/lon coordinates to eWKT representation for geoalchemy.
+    Note that WKT is lon/lat in that order, which both PostGIS and GeoAlchemy expect.
+    """
+    return f"SRID=4326; Point({lon} {lat})"
 
 
 def parse_command_line():
