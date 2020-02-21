@@ -10,15 +10,15 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import scoped_session, sessionmaker
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import ClauseElement
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm.exc import  NoResultFound
+from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.orm.exc import  NoResultFound, MultipleResultsFound
 
 Base = declarative_base()
 DBSession = scoped_session(sessionmaker())
 engine = None
 
 # How many TSV lines to batch up together. 10,000 seemed to be a good balance between db and parsing time in testing.
-COMMIT_BATCH = 1000
+COMMIT_BATCH = 10000
 
 # What version of the eBird metadata does this import script support?
 EBIRD_METADATA_VERSION = "1.12"
@@ -153,147 +153,22 @@ def parse_ebird_dump(file_path, start_row, taxa_csv_path=None):
         # Batch our database inserts/updates to keep from having a commit() every single call.
         # This could potentially lead to problems if we need to look up something that hasn't been committed yet, but it seems that the caching takes care of this. This could be a problem, in general.
         try:
-            for row in reader:
-                err = row
+            batch = []
+            for r in reader:
+                err = r
                 if count < start_row:
                     count += 1
                     continue
-                # Observation
-                # ID in the data has the form of URN:CornellLabOfOrnithology:EBIRD:OBS######, and we want just the #s at the end for the id.
-                observation_id = int(row['GLOBAL UNIQUE IDENTIFIER'].split(':')[-1][3:])
-                # ID in the data has form 'S########' and we want just the #s at the end.
-                checklist_id = int(row['SAMPLING EVENT IDENTIFIER'][1:])
-                obs_count = row['OBSERVATION COUNT']
-                if obs_count == 'X':
-                    number_observed = None
-                    is_x = True
-                else:
-                    number_observed = obs_count
-                    is_x = False
-                age_sex = row['AGE/SEX']
-                species_comments = row['SPECIES COMMENTS']
-                # breeding_atlas_code = row['BREEDING BIRD ATLAS CODE']
-                # Species
-                # taxonomic_order = decimal_or_none(row['TAXONOMIC ORDER'])
-                species_category = row['CATEGORY']
-                # common_name = row['COMMON NAME']
-                scientific_name = row['SCIENTIFIC NAME']
-                # subspecies_common_name = row['SUBSPECIES COMMON NAME']
-                subspecies_scientific_name = row['SUBSPECIES SCIENTIFIC NAME']
-                if subspecies_scientific_name == '':
-                    subspecies_scientific_name = None
-                # Conceptually, anything that isn't a 'species' is stored in the the SubSpecies model.
-                # This differs from the ebird data where, for example, 'spuhs' are top-level species.
-                # This is to massage the data to be more in line with that schema.
-                if species_category in ('spuh', 'slash', 'hybrid'):
-                    subspecies_scientific_name = scientific_name
-                    scientific_name = None
-                elif species_category in ('domestic', 'form'):
-                    if scientific_name in subspecies_sci_names:
-                        # subspecies_scientific_name = scientific_name
-                        scientific_name = None
-                # Checklist
-                checklist_date = row['OBSERVATION DATE']
-                checklist_time = row['TIME OBSERVATIONS STARTED']
-                checklist_duration = row['DURATION MINUTES']
-                start, duration = parse_start_duration(checklist_date, checklist_time, checklist_duration)
-                checklist_comments = row['TRIP COMMENTS']
-                distance = decimal_or_none(row['EFFORT DISTANCE KM'])
-                area = decimal_or_none(row['EFFORT AREA HA'])
-                number_of_observers = int_or_none(row['NUMBER OBSERVERS'])
-                complete_checklist = bool(int(row['ALL SPECIES REPORTED']))
-                # group id in the form of 'G######' but we want just #s.
-                group_id = int_or_none(row['GROUP IDENTIFIER'][1:])
-                approved = bool(int(row['APPROVED']))
-                reviewed = bool(int(row['REVIEWED']))
-                reason = row['REASON']
-                protocol = row['PROTOCOL TYPE']
-                proto = protocol_words_to_code(protocol)
-                project_code = row['PROJECT CODE']
-                # Observer
-                # The is is in the form of 'obsr######' but we want just the #s.
-                observer_id = int(row['OBSERVER ID'][4:])
-                # Location
-                lat = float(row['LATITUDE'])
-                lon = float(row['LONGITUDE'])
-                coords = coords_to_EWKT(lat=lat, lon=lon, srid=4326)
-                locality_name = row['LOCALITY']
-                # In data in the form of 'L#######' but we want just #s.
-                locality_id = int(row['LOCALITY ID'][1:])
-                locality_type = row['LOCALITY TYPE']
-                state_code = row['STATE CODE']
-                county_code = row['COUNTY CODE']
-                county = row['COUNTY']
-                state_province = row['STATE']
-                country = row['COUNTRY']
-                country_code = row['COUNTRY CODE']
-                has_media = bool(int(row['HAS MEDIA']))
-                edit = row['LAST EDITED DATE']
-                if edit != '':
-                    last_edit = datetime.strptime(edit, "%Y-%m-%d %H:%M:%S")
-                else:
-                    last_edit = None
-                # Start with the models that don't depend on other models and have single attributes.
-                # All of these fields can potentially be blank.
-                sp, _ = state_lru_cache_stub(state_province, state_code)
-
-                cnty, _ = county_lru_cache_stub(county, county_code)
-
-                local, _ = locality_lru_cache_stub(locality_id, locality_type, locality_name)
-
-                fn = get_or_create
-                kwargs = {'session': DBSession, 'model': Country, 'defaults': {'country': country}, 'country_code': country_code}
-                cntry = create_or_cache(country_code_cache, fn, kwargs, country_code)
-
-                if observer_id == '':
-                    obs = None
-                else:
-                    obs, _ = observer_lru_cache_stub(observer_id)
-                # Then continue with the models that only depend on the ones we've got.
-                loc, _ = get_or_create(DBSession, Location,
-                    defaults={'locality_id': locality_id, 'country_id': country_code, 'state_province_id': state_code, 'county_id': county_code},
-                    coords=coords)
-                # Next the checklist model
-                check, _ = get_or_create(
-                    DBSession,
-                    Checklist,
-                    defaults={
-                        'location_id': loc.id, 'start_date_time': start, 'checklist_comments': checklist_comments,
-                        'duration': duration, 'distance': distance, 'area': area,
-                        'number_of_observers': number_of_observers, 'complete_checklist': complete_checklist,
-                        'group_id': group_id, 'approved': approved, 'reviewed': reviewed, 'reason': reason,
-                        'protocol': proto,
-                        'project_code': project_code},
-                    checklist=checklist_id
-                    )
-                # Finally the remaining models that depend on all the previous ones.
-                # We don't care about the result here because get_or_create is being used to be idempotent.
-                _, _ = get_or_create(
-                    DBSession,
-                    Observation,
-                    defaults={
-                        'number_observed': number_observed,
-                        'is_x': is_x,
-                        'age_sex': age_sex,
-                        'species_comments': species_comments,
-                        'species_id': scientific_name,
-                        'subspecies_id': subspecies_scientific_name, #'breeding_atlas_code': breeding_atlas_code,
-                        'date_last_edit': last_edit,
-                        'has_media': has_media,
-                        'checklist_id': check.checklist,
-                        'observer_id': obs.observer_id},
-                    observation=observation_id,
-                    )
-
-                count += 1
-                if count % COMMIT_BATCH == 0:
-                    DBSession.commit()
-                    dt_stamp = curr_time()
-                    print(f"{dt_stamp} Commit:  {count}")
-                    cache_sizes = f"country: {len(country_code_cache)}"
-                    print(cache_sizes)
-                    lru_cache_stats = f"state: {state_lru_cache_stub.cache_info()}, county: {county_lru_cache_stub.cache_info()}, locality: {locality_lru_cache_stub.cache_info()}, obs: {observer_lru_cache_stub.cache_info()}"
-                    print(lru_cache_stats)
+                batch += [r]
+                if len(batch) == COMMIT_BATCH:
+                    while True:
+                        try:
+                            row_batch(batch, count, species_sci_names, subspecies_sci_names, country_code_cache)
+                            count += COMMIT_BATCH
+                            break
+                        except OperationalError:
+                            print(f"{curr_time()} Rollback at:  {count}")
+                    batch = []
         except KeyError as ex:
             print(f"Encountered unknown column {ex} in input data.")
             print(f"This importer only supports version {EBIRD_METADATA_VERSION}, please ensure your data is of this version as eBird makes changes to the dataset frequently.")
@@ -309,6 +184,174 @@ def parse_ebird_dump(file_path, start_row, taxa_csv_path=None):
         # Making sure everything is definitely comitted.
         DBSession.commit()
         print(f"Final count: {count}, End time: {curr_time()}")
+
+
+def row_batch(batch, count, sp_names, ssp_names, ccc):
+    """
+    Run a batch of rows.
+    Args:
+        batch (list(dict)): Rows from csv.dictreader to parse and insert into the db.
+        count (int): Current count of rows.
+        sp_names (set): species names.
+        ssp_names (set): subspecies names.
+        ccc (dict): country code cache.
+    """
+    for row in batch:
+        parse_and_insert(row, sp_names, ssp_names, ccc)
+        count += 1
+    DBSession.commit()
+    print(f"{curr_time()} Commit:  {count}")
+    cache_sizes = f"country: {len(ccc)}"
+    print(cache_sizes)
+    lru_cache_stats = f"state: {state_lru_cache_stub.cache_info()}, county: {county_lru_cache_stub.cache_info()}, locality: {locality_lru_cache_stub.cache_info()}, obs: {observer_lru_cache_stub.cache_info()}"
+    print(lru_cache_stats)
+
+
+def parse_and_insert(row, species_sci_names, subspecies_sci_names, country_code_cache):
+    """
+    Handle the parsing a row of data and inserting it into the database as needed.
+    Args:
+        row (dict): CSV row to be parsed.
+        species_sci_names (set): all species' scientific names.
+        subspecies_sci_names (set): all subspecies' scientific names.
+        country_code_cache (dict): {"Canada": "CA"} mappins so we don't need to do a db lookup each time.
+    """
+    # Observation
+    # ID in the data has the form of URN:CornellLabOfOrnithology:EBIRD:OBS######, and we want just the #s at the end for the id.
+    observation_id = int(row['GLOBAL UNIQUE IDENTIFIER'].split(':')[-1][3:])
+    # ID in the data has form 'S########' and we want just the #s at the end.
+    checklist_id = int(row['SAMPLING EVENT IDENTIFIER'][1:])
+    obs_count = row['OBSERVATION COUNT']
+    if obs_count == 'X':
+        number_observed = None
+        is_x = True
+    else:
+        number_observed = obs_count
+        is_x = False
+    age_sex = row['AGE/SEX']
+    species_comments = row['SPECIES COMMENTS']
+    # breeding_atlas_code = row['BREEDING BIRD ATLAS CODE']
+    # Species
+    # taxonomic_order = decimal_or_none(row['TAXONOMIC ORDER'])
+    species_category = row['CATEGORY']
+    # common_name = row['COMMON NAME']
+    scientific_name = row['SCIENTIFIC NAME']
+    # subspecies_common_name = row['SUBSPECIES COMMON NAME']
+    subspecies_scientific_name = row['SUBSPECIES SCIENTIFIC NAME']
+    if subspecies_scientific_name == '':
+        subspecies_scientific_name = None
+    # Conceptually, anything that isn't a 'species' is stored in the the SubSpecies model.
+    # This differs from the ebird data where, for example, 'spuhs' are top-level species.
+    # This is to massage the data to be more in line with that schema.
+    if species_category in ('spuh', 'slash', 'hybrid'):
+        subspecies_scientific_name = scientific_name
+        scientific_name = None
+    elif species_category in ('domestic', 'form'):
+        if scientific_name in subspecies_sci_names:
+            # subspecies_scientific_name = scientific_name
+            scientific_name = None
+    # Checklist
+    checklist_date = row['OBSERVATION DATE']
+    checklist_time = row['TIME OBSERVATIONS STARTED']
+    checklist_duration = row['DURATION MINUTES']
+    start, duration = parse_start_duration(checklist_date, checklist_time, checklist_duration)
+    checklist_comments = row['TRIP COMMENTS']
+    distance = decimal_or_none(row['EFFORT DISTANCE KM'])
+    area = decimal_or_none(row['EFFORT AREA HA'])
+    number_of_observers = int_or_none(row['NUMBER OBSERVERS'])
+    complete_checklist = bool(int(row['ALL SPECIES REPORTED']))
+    # group id in the form of 'G######' but we want just #s.
+    group_id = int_or_none(row['GROUP IDENTIFIER'][1:])
+    approved = bool(int(row['APPROVED']))
+    reviewed = bool(int(row['REVIEWED']))
+    reason = row['REASON']
+    protocol = row['PROTOCOL TYPE']
+    proto = protocol_words_to_code(protocol)
+    project_code = row['PROJECT CODE']
+    # Observer
+    # The is is in the form of 'obsr######' but we want just the #s.
+    observer_id = int(row['OBSERVER ID'][4:])
+    # Location
+    lat = float(row['LATITUDE'])
+    lon = float(row['LONGITUDE'])
+    coords = coords_to_EWKT(lat=lat, lon=lon, srid=4326)
+    locality_name = row['LOCALITY']
+    # In data in the form of 'L#######' but we want just #s.
+    locality_id = int(row['LOCALITY ID'][1:])
+    locality_type = row['LOCALITY TYPE']
+    state_code = row['STATE CODE']
+    county_code = row['COUNTY CODE']
+    county = row['COUNTY']
+    state_province = row['STATE']
+    country = row['COUNTRY']
+    country_code = row['COUNTRY CODE']
+    has_media = bool(int(row['HAS MEDIA']))
+    edit = row['LAST EDITED DATE']
+    if edit != '':
+        last_edit = datetime.strptime(edit, "%Y-%m-%d %H:%M:%S")
+    else:
+        last_edit = None
+    # Start with the models that don't depend on other models and have single attributes.
+    # All of these fields can potentially be blank.
+    sp, _ = state_lru_cache_stub(state_province, state_code)
+
+    cnty, _ = county_lru_cache_stub(county, county_code)
+
+    local, _ = locality_lru_cache_stub(locality_id, locality_type, locality_name)
+
+    fn = get_or_create
+    kwargs = {'session': DBSession, 'model': Country, 'defaults': {'country': country}, 'country_code': country_code}
+    cntry = create_or_cache(country_code_cache, fn, kwargs, country_code)
+
+    if observer_id == '':
+        obs = None
+    else:
+        obs, _ = observer_lru_cache_stub(observer_id)
+    # Then continue with the models that only depend on the ones we've got.
+    # Coordinates aren't unique.
+    try:
+        loc, _ = get_or_create(DBSession, Location,
+            defaults={'country_id': country_code, 'state_province_id': state_code, 'county_id': county_code, "coords": coords},
+            locality_id=locality_id)
+    except MultipleResultsFound as ex:
+            print(f"Multiple results.")
+            print(f"country: {country_code}, state: {state_code}, county: {county_code}, coords: {coords}, locality: {locality_id}")
+            test = DBSession.query(Location).filter_by(locality_id=locality_id)
+            test_res = DBSession.query(Location).filter_by(locality_id=locality_id).all()
+            print(f"Test: {test}.\nResults: {test_res}")
+            raise ex            
+    # Next the checklist model
+    check, _ = get_or_create(
+        DBSession,
+        Checklist,
+        defaults={
+            'location_id': loc.id, 'start_date_time': start, 'checklist_comments': checklist_comments,
+            'duration': duration, 'distance': distance, 'area': area,
+            'number_of_observers': number_of_observers, 'complete_checklist': complete_checklist,
+            'group_id': group_id, 'approved': approved, 'reviewed': reviewed, 'reason': reason,
+            'protocol': proto,
+            'project_code': project_code},
+        checklist=checklist_id
+        )
+    # Finally the remaining models that depend on all the previous ones.
+    # We don't care about the result here because get_or_create is being used to be idempotent.
+    _, _ = get_or_create(
+        DBSession,
+        Observation,
+        defaults={
+            'number_observed': number_observed,
+            'is_x': is_x,
+            'age_sex': age_sex,
+            'species_comments': species_comments,
+            'species_id': scientific_name,
+            'subspecies_id': subspecies_scientific_name, #'breeding_atlas_code': breeding_atlas_code,
+            'date_last_edit': last_edit,
+            'has_media': has_media,
+            'checklist_id': check.checklist,
+            'observer_id': obs.observer_id},
+        observation=observation_id,
+        )
+
 
 
 @lru_cache(maxsize=65536)
@@ -451,6 +494,7 @@ def protocol_words_to_code(protocol):
         'Stationary': '21',
         'Traveling': '22',
         'Area': '23',
+        'Transect': '25',  # Not in metadata document.
         'Trail Tracker': '30',
         'Banding': '33',
         'Waterbird Count': '34',
@@ -469,7 +513,7 @@ def protocol_words_to_code(protocol):
         'Greater Gulf Refuge Waterbird Count': '51',
         'Oiled Birds': '52',
         'Nocturnal Flight Call Count': '54',
-        'Heron Stationary Count*': '55',
+        'Heron Stationary Count': '55',
         'Heron Area Count': '56',
         'Great Texas Birding Classic': '57',
         'Audubon Coastal Bird Survey': '58',
@@ -489,6 +533,7 @@ def protocol_words_to_code(protocol):
         'PROALAS': '73',
         'International Shorebird Survey (ISS)': '74',
         'Tricolored Blackbird Winter Survey': '75',
+        'CWC Traveling Count': '80',  # Not in metadata document.
         }
     return conversion[protocol]
 
